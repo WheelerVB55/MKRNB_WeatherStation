@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "..\\.."
+		},
+		{
+			"name": "MKRNB1500WeatherStation",
+			"path": ".."
+		},
+		{
+			"name": "scratch",
+			"path": "..\\..\\scratch"
+		}
+	],
+	"settings": {}
+}
