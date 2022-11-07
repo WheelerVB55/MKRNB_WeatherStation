@@ -1,14 +1,5 @@
 //.ino file type
 
-// last edit: added AT reset command and automatic mode, MQTT has some intermittent connectivity issues
-// last edit: adding PMIC MQTT checks
-// It seems either the MQTT or PMIC is causing hanging issues after client2.get(), that is
-// if it sends a null value or invalid request.
-//
-// 08/11: seeemed to have fixed indefinite hang issue, it now hangs approxiamately for 1 minute if bad get request is sent
-// mqtt and pmic now work in tandem with minimal connectivity problems so far
-//
-
 #include <MKRNB.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -21,15 +12,38 @@
 #include <Arduino_PMIC.h>
 #include "secrets.h"
 //#include <MQTT.h>
-//#include <BQ24195.h> //Charge Timer Control Register, BQ24195 chip Power Managment IC
 
 /*
     Variable Declaration
 */
-//! int modem_reset = 0;
+
+unsigned long baud = 115200;
+
+// HTTP and GPRS connection clients
 const char NB_PINNUMBER[] = "";
 const char HTTP_HOST_NAME[] = "3d.chordsrt.com";
+int HTTP_PORT = 80;
+int HTTP_RESPONSE_TIMEOUT;
+int modem_reset = 0;
 
+// Constants for Average Sea Level Pressure
+const int Fargo_altitude = 276; // in meters
+const double N = -5.257;
+
+// Rain bucket and Anemometer Pinouts and counters
+volatile float RAIN_COUNTER = 0.0;
+volatile float WIND_COUNTER = 0.0;
+const float RAIN_CALIBRATION = 0.19;
+const int RAIN_PIN = 4;
+const int ANEMOMETER_PIN = 5;
+float SEA_LEVEL_PRESSURE;
+
+// Timers to control loop duration
+unsigned long timerMillis = 0;
+unsigned long lastMillis = 0;
+int READ_COUNTER = 0;
+
+//! values assigned to strings to be sent in GET request (ID)
 String URL_REQUEST;
 String URL_REQUEST_ADDRESS = "/measurements/url_create?";
 String INSTRUMENT_ID = "92";
@@ -46,36 +60,21 @@ String HTTP_RESPONSE;
 String HTTP_STATUS_CODE;
 String *MODEM_RESPONSE_STORAGE;
 
-const int Fargo_altitude = 276; // in meters
-const double N = -5.257;
-
-volatile float RAIN_COUNTER = 0.0;
-volatile float WIND_COUNTER = 0.0;
-const float RAIN_CALIBRATION = 0.19;
-float SEA_LEVEL_PRESSURE;
-
-const int RAIN_PIN = 4;
-const int ANEMOMETER_PIN = 5;
-int HTTP_PORT = 80;
-unsigned long timerMillis = 0;
-unsigned long lastMillis = 0;
-int READ_COUNTER = 0;
-int HTTP_RESPONSE_TIMEOUT;
-
 /*
     Constructors
 */
+
 sensors_event_t htu_humidity, htu_temp;
-Adafruit_BMP3XX bmp;
-Adafruit_HTU31D htu;
-Adafruit_MCP9808 mcp;
-Adafruit_SI1145 uv = Adafruit_SI1145();
-AS5600 as5600;
-NBClient nbclient;
-GPRS gprs;
-NB nbAccess(true);
+Adafruit_BMP3XX bmp;                    // pressure
+Adafruit_HTU31D htu;                    // humidity
+Adafruit_MCP9808 mcp;                   // temperature
+Adafruit_SI1145 uv = Adafruit_SI1145(); // ir
+AS5600 as5600;                          // windvane
+NBClient nbclient;                      // narrowband client
+NB nbAccess(true);                      // see AT command serial printout
 NBScanner scannerNetworks;
 NBModem modem;
+GPRS gprs; // general packet radio service
 // MQTTClient mqttclient(200);
 
 /*
@@ -83,12 +82,14 @@ NBModem modem;
 */
 
 // Increments the volatile WIND_COUNTER variable
+// Anemometer (pin 5)
 void WindInterrupt()
 {
   WIND_COUNTER += 1.0;
 }
 
 // Increments the volatile RAIN_COUNTER variable
+// rain bucket (pin 6)
 void RainInterrupt()
 {
   RAIN_COUNTER += 1.0;
@@ -96,13 +97,22 @@ void RainInterrupt()
 
 void NB_Reconnect()
 {
+  //! restarts the modem after every 60 minutes
+  // testing 10/24 for modem_rest func
+  modem_reset = modem_reset + 1;
+
+  if (modem_reset > 60)
+  {
+    modem_reset = 0;
+    Serial.println("Restarting the Modem."); // check if modem.begin is indirectly causing shutdown
+    MODEM.send("AT+COPS=0");                 // force into automatic mode
+  }
 
   while (nbAccess.isAccessAlive() == 0)
   {
-    MODEM.begin(true);       // force restarts the modem.
-    MODEM.send("AT+COPS=0"); // forces NBClient into automatic mode
-    MODEM.send("AT+CMEE=2");
-    MODEM.waitForResponse();
+    // MODEM.begin(true); //The SARA-R410M is bricked after this due to library/manual differences in power/on off functions
+    // MODEM.send("AT+COPS=0"); // forces NBClient into automatic mode
+    // MODEM.waitForResponse();
 
     if ((nbAccess.begin(NB_PINNUMBER) == NB_READY) &&
         (gprs.attachGPRS() == GPRS_READY))
@@ -112,7 +122,8 @@ void NB_Reconnect()
     else
     {
       Serial.println("Failed to restablish connection to NBClient.");
-      MODEM.waitForResponse(2000);
+      MODEM.waitForResponse(2000); // check library for functionality
+      // delay(1000); //add count to activate atcops
     }
   }
 }
@@ -198,6 +209,48 @@ void GetI2CSensorData()
   MCP9808_TEMP = String(float(mcp.readTempC()));
 }
 
+/*void Response_Read()
+{
+    if(httpClient.connected())
+  {
+    httpClient.get(String(URL_REQUEST));
+    }
+    long response_time = (millis() - (timerMillis));
+
+    Serial.println(*MODEM_RESPONSE_STORAGE);
+
+    HTTP_RESPONSE_TIMEOUT = 0;
+
+    while (!httpClient.available())
+  {
+    if (HTTP_RESPONSE_TIMEOUT >= 3600)
+    {
+      Serial.println(F("HTTP Response Timed Out"));
+      break;
+    }
+    else
+      HTTP_RESPONSE_TIMEOUT++;
+
+    delay(100);
+  }
+
+  while (httpClient.available())
+  {
+    httpClient.read();
+    READ_COUNTER++;
+    delay(10);
+  }
+
+    int statusCode = httpClient.responseStatusCode();
+    String response = httpClient.responseBody();
+    Serial.print(F("READ COUNTER: "));
+    Serial.println(F(READ_COUNTER));
+    Serial.print(F("Response Time: "));
+    Serial.println(F(response_time));
+
+  // READ_COUNTER = 0;
+}*/
+
 /*
   ==============================================
   BEGIN CODE BODY
@@ -206,8 +259,9 @@ void GetI2CSensorData()
 
 void setup()
 {
-  Serial.begin(115200);
-  delay(500);
+  Serial.begin(baud); // baud rate affect connectivity?
+  // The firmware that Arduino.cc is selling on the modems on this device is 3 years old and this is apparently a known bug with that firmware. Upgrading it requires that you solder a USB cable to pads on the board and getting the FW from UBlox.
+  delay(20000); // Modem has wakeup time?
 
   pinMode(ANEMOMETER_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(ANEMOMETER_PIN), WindInterrupt, RISING);
@@ -240,7 +294,7 @@ void setup()
 void loop()
 {
 
-  Calibrate_Wind_Direction(); // Uncomment when calibrating wind vane
+  // Calibrate_Wind_Direction(); // Uncomment when calibrating wind vane
 
   lastMillis = millis();
 
@@ -258,49 +312,13 @@ void loop()
   HttpClient httpClient = HttpClient(nbclient, HTTP_HOST_NAME, HTTP_PORT);
   Serial.println(URL_REQUEST);
   httpClient.get(String(URL_REQUEST));
-  // if(httpClient.connected())
-  //{
-  //     httpClient.get(String(URL_REQUEST));
-  // }
-  // long response_time = (millis() - (timerMillis));
 
-  // Serial.println(*MODEM_RESPONSE_STORAGE);
-
-  // HTTP_RESPONSE_TIMEOUT = 0;
-  /*
-   while (!httpClient.available())
-  {
-    if (HTTP_RESPONSE_TIMEOUT >= 3600)
-    {
-      Serial.println(F("HTTP Response Timed Out"));
-      break;
-    }
-    else
-      HTTP_RESPONSE_TIMEOUT++;
-
-    delay(100);
-  }
-
-  while (httpClient.available())
-  {
-    httpClient.read();
-    READ_COUNTER++;
-    delay(10);
-  }*/
-
-  // int statusCode = httpClient.responseStatusCode();
-  // String response = httpClient.responseBody();
-  // Serial.print(F("READ COUNTER: "));
-  // Serial.println(F(READ_COUNTER));
-  // Serial.print(F("Response Time: "));
-  // Serial.println(F(response_time));
-
-  // READ_COUNTER = 0;
   RAIN_COUNTER = 0;
   WIND_COUNTER = 0;
-
-  while ((millis() - lastMillis) <= 60000)
+  httpClient.flush();
+  while ((millis() - lastMillis) <= 50000)
     ;
 
   httpClient.stop();
+  delay(10000);
 }
