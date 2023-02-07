@@ -10,12 +10,14 @@
 #include <AS5600.h>
 #include <ArduinoHttpClient.h>
 #include <Arduino_PMIC.h>
+#include <WDTZero.h>
 #include "secrets.h"
-//#include <MQTT.h>
 
 /*
     Variable Declaration
 */
+
+WDTZero MyWatchDoggy; //! Define WDT
 
 unsigned long baud = 115200;
 
@@ -24,9 +26,12 @@ const char NB_PINNUMBER[] = "";
 const char HTTP_HOST_NAME[] = "3d.chordsrt.com";
 int HTTP_PORT = 80;
 int HTTP_RESPONSE_TIMEOUT;
+int modem_auto = 0;
 int modem_reset = 0;
 
 // Constants for Average Sea Level Pressure
+//!! -------------------------- !! //
+// Change Altitude to current location //
 const int Fargo_altitude = 276; // in meters
 const double N = -5.257;
 
@@ -46,7 +51,7 @@ int READ_COUNTER = 0;
 //! values assigned to strings to be sent in GET request (ID)
 String URL_REQUEST;
 String URL_REQUEST_ADDRESS = "/measurements/url_create?";
-String INSTRUMENT_ID = "92";
+String INSTRUMENT_ID = "";
 String BMP390_TEMP;
 String BMP390_PRESSURE;
 String BMP390_ALTITUDE;
@@ -75,7 +80,6 @@ NB nbAccess(true);                      // see AT command serial printout
 NBScanner scannerNetworks;
 NBModem modem;
 GPRS gprs; // general packet radio service
-// MQTTClient mqttclient(200);
 
 /*
     Function Creation
@@ -83,6 +87,7 @@ GPRS gprs; // general packet radio service
 
 // Increments the volatile WIND_COUNTER variable
 // Anemometer (pin 5)
+
 void WindInterrupt()
 {
   WIND_COUNTER += 1.0;
@@ -97,22 +102,9 @@ void RainInterrupt()
 
 void NB_Reconnect()
 {
-  //! restarts the modem after every 60 minutes
-  // testing 10/24 for modem_rest func
-  modem_reset = modem_reset + 1;
-
-  if (modem_reset > 60)
-  {
-    modem_reset = 0;
-    Serial.println("Restarting the Modem."); // check if modem.begin is indirectly causing shutdown
-    MODEM.send("AT+COPS=0");                 // force into automatic mode
-  }
 
   while (nbAccess.isAccessAlive() == 0)
   {
-    // MODEM.begin(true); //The SARA-R410M is bricked after this due to library/manual differences in power/on off functions
-    // MODEM.send("AT+COPS=0"); // forces NBClient into automatic mode
-    // MODEM.waitForResponse();
 
     if ((nbAccess.begin(NB_PINNUMBER) == NB_READY) &&
         (gprs.attachGPRS() == GPRS_READY))
@@ -122,10 +114,34 @@ void NB_Reconnect()
     else
     {
       Serial.println("Failed to restablish connection to NBClient.");
-      MODEM.waitForResponse(2000); // check library for functionality
-      // delay(1000); //add count to activate atcops
+      MODEM.sendf("AT+CEREG=1");
+      MODEM.waitForResponse(2000); 
+      MODEM.sendf("AT+CGACT=1");
+      MODEM.waitForResponse(2000);
+      modem_reset++;
+      Serial.println(modem_reset);
+      if (modem_reset > 10)
+      {
+        modem_reset = 0;
+        MODEM.sendf("AT+CFUN=1,1");
+        MODEM.waitForResponse(2000);
+      }
     }
   }
+}
+
+extern "C" char *sbrk(int incr);
+
+int freeRam()
+{
+  char top;
+  return &top - reinterpret_cast<char *>(sbrk(0));
+}
+
+void display_freeram()
+{
+  Serial.print(F("- SRAM left: "));
+  Serial.println(freeRam());
 }
 
 void I2CSensorInitialize()
@@ -175,6 +191,8 @@ void GetWindDirectionData_D()
   WIND_DIRECTION = String(float(as5600.readAngle() * AS5600_RAW_TO_DEGREES));
 }
 
+//! ------------- !//
+// IR SENSOR //
 void GetIRData()
 {
   /*"&si1145_vis" + String(uv.readVisible()) + "&si1145_ir" + String(uv.readIR()) + "&si1145_uv" + String((uv.readUV() / 100)) +*/
@@ -192,7 +210,7 @@ void GetRainData()
 
 void CreateUrlRequest()
 {
-  URL_REQUEST = String(URL_REQUEST_ADDRESS + "instrument_id=" + INSTRUMENT_ID + "&bmp_temp=" + BMP390_TEMP + "&bmp_pressure=" + BMP390_PRESSURE + /*station level pressure---->*/ "&bmp_slp=" + String(SEA_LEVEL_PRESSURE) + "&bmp_altitude=" + BMP390_ALTITUDE + "&htu21d_temp=" + HTU31D_TEMP + "&htu21d_humidity=" + HTU31D_HUMIDITY + "&mcp9808=" + MCP9808_TEMP + "&wind_direction=" + WIND_DIRECTION + "&wind_speed=" + WIND_SPEED + "&rain=" + RAIN_AMOUNT + "&key=" + SECRET_KEY);
+  URL_REQUEST = String(URL_REQUEST_ADDRESS + "instrument_id=" + INSTRUMENT_ID + "&bmp_temp=" + BMP390_TEMP + "&bmp_pressure=" + BMP390_PRESSURE + /*station level pressure---->*/ "&bmp_slp=" + String(SEA_LEVEL_PRESSURE) + "&bmp_altitude=" + BMP390_ALTITUDE + "&htu21d_temp=" + HTU31D_TEMP + "&htu21d_humidity=" + HTU31D_HUMIDITY + "&mcp9808=" + MCP9808_TEMP + "&wind_direction=" + WIND_DIRECTION + "&wind_speed=" + WIND_SPEED + "&rain=" + RAIN_AMOUNT + "&key=" + SECRET_KEY + "&test");
 }
 
 void GetI2CSensorData()
@@ -209,47 +227,11 @@ void GetI2CSensorData()
   MCP9808_TEMP = String(float(mcp.readTempC()));
 }
 
-/*void Response_Read()
+void myshutdown() //! 01.10
 {
-    if(httpClient.connected())
-  {
-    httpClient.get(String(URL_REQUEST));
-    }
-    long response_time = (millis() - (timerMillis));
 
-    Serial.println(*MODEM_RESPONSE_STORAGE);
-
-    HTTP_RESPONSE_TIMEOUT = 0;
-
-    while (!httpClient.available())
-  {
-    if (HTTP_RESPONSE_TIMEOUT >= 3600)
-    {
-      Serial.println(F("HTTP Response Timed Out"));
-      break;
-    }
-    else
-      HTTP_RESPONSE_TIMEOUT++;
-
-    delay(100);
-  }
-
-  while (httpClient.available())
-  {
-    httpClient.read();
-    READ_COUNTER++;
-    delay(10);
-  }
-
-    int statusCode = httpClient.responseStatusCode();
-    String response = httpClient.responseBody();
-    Serial.print(F("READ COUNTER: "));
-    Serial.println(F(READ_COUNTER));
-    Serial.print(F("Response Time: "));
-    Serial.println(F(response_time));
-
-  // READ_COUNTER = 0;
-}*/
+  Serial.print("\nMKRNB1500 restarting! ...");
+}
 
 /*
   ==============================================
@@ -261,7 +243,7 @@ void setup()
 {
   Serial.begin(baud); // baud rate affect connectivity?
   // The firmware that Arduino.cc is selling on the modems on this device is 3 years old and this is apparently a known bug with that firmware. Upgrading it requires that you solder a USB cable to pads on the board and getting the FW from UBlox.
-  delay(20000); // Modem has wakeup time?
+  delay(20000); // Modem has wakeup time
 
   pinMode(ANEMOMETER_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(ANEMOMETER_PIN), WindInterrupt, RISING);
@@ -270,6 +252,10 @@ void setup()
   attachInterrupt(digitalPinToInterrupt(RAIN_PIN), RainInterrupt, RISING);
 
   analogReadResolution(12); // 12 bit ADC value
+
+  Serial.print("\nWDTZero : Setup Soft Watchdog at 2 minute interval");
+  MyWatchDoggy.attachShutdown(myshutdown);
+  MyWatchDoggy.setup(WDT_SOFTCYCLE2M); // initialize WDT-softcounter refesh cycle on 2 minute interval
 
   boolean connected = false;
 
@@ -284,7 +270,7 @@ void setup()
     else
     {
       Serial.println("Failed to connect to NBClient, trying again.");
-      delay(1000);
+      delay(3000);
     }
   }
 
@@ -297,15 +283,15 @@ void loop()
   // Calibrate_Wind_Direction(); // Uncomment when calibrating wind vane
 
   lastMillis = millis();
-
-  Serial.println(F("Made it here"));
+  MyWatchDoggy.clear(); //! 01.10
+  Serial.println(F("Beginning of Loop"));
 
   NB_Reconnect();
 
   GetI2CSensorData();
   GetWindSpeedData();
   GetRainData();
-  GetWindDirectionData_D();
+  GetWindDirectionData_A(); //! specify analog or digital before operation !//
   CreateUrlRequest();
 
   // timerMillis = millis();
@@ -315,10 +301,11 @@ void loop()
 
   RAIN_COUNTER = 0;
   WIND_COUNTER = 0;
-  httpClient.flush();
+  httpClient.flush(); // graceful socket disconnect
   while ((millis() - lastMillis) <= 50000)
     ;
 
   httpClient.stop();
-  delay(10000);
+  delay(10000); //
+  // AT serial socket still transitions intermittently to #1 but returns to #0 shortly afterwards
 }
